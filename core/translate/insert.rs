@@ -61,6 +61,20 @@ use turso_parser::ast::{
     TriggerTime, Upsert, UpsertDo, With,
 };
 
+/// Return the column-name list for any `Table` (btree, virtual, or view).
+/// Used by the RBAC INSERT hook to populate `columns_touched` when the
+/// statement omits an explicit column list (`INSERT INTO foo VALUES (...)`
+/// or `INSERT INTO foo DEFAULT VALUES`). Works uniformly for btree and
+/// virtual tables — closes the vtab-bypass gap by giving the authorizer
+/// the same column visibility regardless of table kind.
+fn table_columns(table: &Table) -> Vec<String> {
+    table
+        .columns()
+        .iter()
+        .filter_map(|c| c.name.clone())
+        .collect()
+}
+
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(
     table_name: &str,
@@ -287,6 +301,27 @@ pub fn translate_insert(
         connection,
     )?;
 
+    // RBAC: authorize early so virtual-table inserts go through the same
+    // check as btree inserts. Without this, an FTS5/JSON1/vec0/custom-vtab
+    // INSERT would skip the authorizer entirely because the vtab branch
+    // below `return`s before the btree-path hook would fire. We use the
+    // schema's reported column list to populate `columns_touched` — this
+    // works for both vtab and btree tables since both expose `columns()`.
+    if !crate::rbac::is_dormant(connection) {
+        let auth_columns: Vec<String> = if columns.is_empty() {
+            table_columns(&table)
+        } else {
+            columns.iter().map(|n| n.as_str().to_string()).collect()
+        };
+        let _ = crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(table_name.as_str()),
+            crate::rbac::AuthOp::Insert,
+            &auth_columns,
+        )?;
+    }
+
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
         translate_virtual_table_insert(
@@ -318,6 +353,57 @@ pub fn translate_insert(
         on_conflict.unwrap_or(ResolveType::Abort),
         database_id,
     )?;
+
+    // RBAC: the INSERT itself was already authorized above (before the
+    // virtual-table branch). Here we additionally authorize UPSERT-side
+    // UPDATEs and capture the INSERT-side CHECK predicate (if any) so it
+    // can be threaded into emit_check_constraints below.
+    let insert_check_predicate: Option<ast::Expr> = if crate::rbac::is_dormant(connection) {
+        None
+    } else {
+        let insert_columns: Vec<String> = if columns.is_empty() {
+            btree_table
+                .columns()
+                .iter()
+                .filter_map(|c| c.name.clone())
+                .collect()
+        } else {
+            columns.iter().map(|n| n.as_str().to_string()).collect()
+        };
+        // Re-run INSERT authorization to capture the CHECK predicate (the
+        // early-call return value was discarded). This is the simplest
+        // place to thread CHECK through without restructuring bind_insert.
+        let insert_check = match crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(table_name.as_str()),
+            crate::rbac::AuthOp::Insert,
+            &insert_columns,
+        )? {
+            crate::rbac::HookDecision::Allow => None,
+            crate::rbac::HookDecision::Predicates(payload) => payload.check,
+        };
+        // UPSERT escalation: if the statement has `ON CONFLICT … DO UPDATE SET …`,
+        // additionally authorize an UPDATE op against every SET target.
+        for (_, _, upsert) in &upsert_actions {
+            if let UpsertDo::Set { sets, .. } = &upsert.do_clause {
+                let upsert_cols: Vec<String> = sets
+                    .iter()
+                    .flat_map(|s| s.col_names.iter().map(|n| n.as_str().to_string()))
+                    .collect();
+                if !upsert_cols.is_empty() {
+                    let _ = crate::rbac::authorize(
+                        connection,
+                        resolver.schema(),
+                        Some(table_name.as_str()),
+                        crate::rbac::AuthOp::Update,
+                        &upsert_cols,
+                    )?;
+                }
+            }
+        }
+        insert_check
+    };
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
@@ -765,10 +851,30 @@ pub fn translate_insert(
         )?;
     }
 
-    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
+    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints.
+    // RBAC: if the INSERT-side grant returned a CHECK predicate (GAP 5 fix),
+    // synthesize a transient CheckConstraint and prepend it to the table's
+    // own constraints. The transient constraint sees the same column-to-
+    // register mappings, so `@principal.*` substitutions and column refs
+    // resolve correctly. This is the row-level enforcement counterpart to
+    // the column-level denial that fired earlier in the hook.
+    let combined_check_constraints: Vec<schema::CheckConstraint> = if let Some(rbac_check) =
+        insert_check_predicate.as_ref()
+    {
+        let mut combined = Vec::with_capacity(ctx.table.check_constraints.len() + 1);
+        combined.push(schema::CheckConstraint {
+            name: Some("__rbac_check".to_string()),
+            expr: rbac_check.clone(),
+            column: None,
+        });
+        combined.extend(ctx.table.check_constraints.iter().cloned());
+        combined
+    } else {
+        ctx.table.check_constraints.clone()
+    };
     emit_check_constraints(
         program,
-        &ctx.table.check_constraints,
+        &combined_check_constraints,
         resolver,
         &ctx.table.name,
         insertion.key_register(),

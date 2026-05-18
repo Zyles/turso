@@ -63,6 +63,8 @@ prost = "0.14.1"
 roaring = "0.11.2"
 bytes = "1.11.1"
 itertools.workspace = true
+jsonwebtoken = "9"
+base64 = "0.22"
 
 [features]
 default = ["io_uring", "mimalloc", "experimental_win_iocp"]
@@ -73,6 +75,7 @@ mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
 mvcc_repl = []
 stacker = ["turso_core/stacker"]
+pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee", default-features = false, features = ["default-fancy"] }

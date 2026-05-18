@@ -23,6 +23,7 @@ mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+pub mod rbac;
 pub mod schema;
 pub mod state_machine;
 pub mod storage;
@@ -123,6 +124,15 @@ use turso_parser::{ast, ast::Cmd, parser::Parser};
 use util::parse_schema_rows;
 
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+
+/// Re-export the RBAC connection-level types so external crates (notably
+/// `cli/sync_server`) can construct `Principal`s and install authorizers
+/// without making the entire `connection` module public.
+pub mod auth {
+    pub use crate::connection::{
+        AuthMode, ClaimValue, ConnectionAuthorizer, Principal, PrincipalGuard,
+    };
+}
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use error::{io_error, CompletionError, LimboError};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
@@ -1748,6 +1758,7 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            auth: RwLock::new(crate::connection::AuthContext::new_trusted()),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

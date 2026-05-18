@@ -218,6 +218,32 @@ pub fn translate_pragma(
     let opts = ProgramBuilderOpts::new(0, 20, 0);
     program.extend(&opts);
 
+    // RBAC: classify the PRAGMA and dispatch through the authorizer. The
+    // dangerous-PRAGMA hard-deny path (writable_schema, legacy_alter_table,
+    // ...) fires regardless of `is_dormant` because even an in-process CLI
+    // REPL could accidentally execute one — but we only refuse for non-
+    // Trusted callers so the REPL itself stays able to twiddle these flags
+    // for debugging. The grant lookup is fully skipped when dormant.
+    let pragma_name = name.name.as_str();
+    let pragma_class = crate::rbac::pragma_policy::classify(pragma_name);
+    if !crate::rbac::is_dormant(&connection) {
+        if pragma_class.is_dangerous() {
+            return Err(crate::LimboError::AuthorizationDenied(format!(
+                "PRAGMA {pragma_name} is forbidden (enforcement-disabling pragma)"
+            )));
+        }
+        let _ = crate::rbac::authorize(
+            &connection,
+            resolver.schema(),
+            None,
+            crate::rbac::AuthOp::Pragma {
+                name: pragma_name.to_string(),
+                mutates: body.is_some() && pragma_class.is_mutating(),
+            },
+            &[],
+        )?;
+    }
+
     if name.name.as_str().eq_ignore_ascii_case("pragma_list") {
         list_pragmas(program);
         return Ok(());

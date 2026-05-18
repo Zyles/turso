@@ -62,6 +62,38 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    // RBAC: authorize the UPDATE before planning. Trusted dormant connections
+    // skip everything — including the SET-column-name allocation — so the
+    // CLI REPL/embedded path stays a single RwLock read away from the
+    // pre-RBAC fast path. When active, the authorizer hook runs against the
+    // SET column list and, on AllowWithPredicates, the USING expression is
+    // AND-merged into the WHERE clause. CHECK from UPDATE-side grants is
+    // not yet stamped onto the constraint-emission path — denial of
+    // column-level grants is the primary control here.
+    let mut body = body;
+    if !crate::rbac::is_dormant(connection) {
+        let table_name_for_authz = body.tbl_name.name.as_str().to_string();
+        let set_cols: Vec<String> = body
+            .sets
+            .iter()
+            .flat_map(|s| s.col_names.iter().map(|n| n.as_str().to_string()))
+            .collect();
+        match crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(&table_name_for_authz),
+            crate::rbac::AuthOp::Update,
+            &set_cols,
+        )? {
+            crate::rbac::HookDecision::Allow => {}
+            crate::rbac::HookDecision::Predicates(payload) => {
+                if let Some(u) = payload.using {
+                    crate::rbac::and_into_where(&mut body.where_clause, u);
+                }
+            }
+        }
+    }
+
     let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");

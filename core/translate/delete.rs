@@ -90,6 +90,29 @@ pub fn translate_delete(
         connection,
     )?;
 
+    // RBAC: authorize DELETE. columns_touched is empty for DELETE — only
+    // table-level grants apply. USING predicate (when present) is AND-merged
+    // into the WHERE clause so the row scan filters out un-permitted rows
+    // automatically; an empty-columns_touched DELETE that hits no grant is
+    // denied outright. Trusted dormant connections skip the whole check.
+    let mut where_clause = where_clause;
+    if !crate::rbac::is_dormant(connection) {
+        match crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(&normalized_table_name),
+            crate::rbac::AuthOp::Delete,
+            &[],
+        )? {
+            crate::rbac::HookDecision::Allow => {}
+            crate::rbac::HookDecision::Predicates(payload) => {
+                if let Some(u) = payload.using {
+                    crate::rbac::and_into_where(&mut where_clause, u);
+                }
+            }
+        }
+    }
+
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
 

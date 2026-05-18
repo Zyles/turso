@@ -153,6 +153,230 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
+/// JSON-shaped value that can be carried inside a `Principal`'s claims map.
+///
+/// JWTs only ever carry these five shapes through standard claim encoding, and
+/// keeping the type local to `core` avoids pulling `serde_json` into `core`'s
+/// dependency surface. `String`/`Integer`/`Float`/`Bool` map cleanly onto the
+/// turso `Value` types used at predicate-binding time; `Null` becomes
+/// `Value::Null`. Arrays and objects are intentionally not first-class because
+/// predicates can't usefully reference them — operators who need nested claim
+/// access serialize the relevant scalar at token-mint time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+}
+
+impl ClaimValue {
+    /// Convert to a turso `Value` for binding into a prepared statement, used
+    /// by `core::rbac::predicates::substitute_placeholders` when wiring claim
+    /// values into compiled USING/CHECK expressions.
+    pub fn to_value(&self) -> Value {
+        match self {
+            ClaimValue::Null => Value::Null,
+            ClaimValue::Bool(b) => Value::from_i64(if *b { 1 } else { 0 }),
+            ClaimValue::Integer(i) => Value::from_i64(*i),
+            ClaimValue::Float(f) => Value::from_f64(*f),
+            ClaimValue::String(s) => Value::Text(crate::types::Text::new(s.clone())),
+        }
+    }
+}
+
+/// Authenticated principal carried by a sync-server request.
+///
+/// `iss` and `sub` together form the identity key used to look up grants;
+/// neither may be empty (enforced by the JWT verifier). `claims` is the raw
+/// JWT claim set minus protocol claims (`iss`, `sub`, `exp`, `nbf`, `iat`,
+/// `aud`) so RLS predicates can reference application-specific claims via
+/// `@claim.<name>` without leaking through the `@principal.*` namespace.
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub iss: String,
+    pub sub: String,
+    /// Roles attached to the principal. In Mode A (default) this is loaded
+    /// from `_turso_rbac_role_assignments`; in Mode B it comes straight from
+    /// the JWT `roles` claim. The authorizer treats this as authoritative for
+    /// the lifetime of the request.
+    pub roles: Vec<String>,
+    pub claims: std::collections::BTreeMap<String, ClaimValue>,
+    /// Unix epoch seconds at which the JWT expires. Kept on the principal so
+    /// downstream logging/metrics can attribute decisions to a specific token
+    /// without re-decoding.
+    pub exp_unix: i64,
+}
+
+impl Principal {
+    /// Construct a principal directly. The JWT verifier is the normal call site;
+    /// tests build principals here. Empty `iss`/`sub` are rejected because
+    /// grant matching would otherwise short-circuit through the wildcard rule.
+    pub fn new(
+        iss: impl Into<String>,
+        sub: impl Into<String>,
+        roles: Vec<String>,
+        claims: std::collections::BTreeMap<String, ClaimValue>,
+        exp_unix: i64,
+    ) -> Result<Self> {
+        let iss = iss.into();
+        let sub = sub.into();
+        if iss.is_empty() {
+            return Err(LimboError::InternalError(
+                "Principal::new requires non-empty iss".into(),
+            ));
+        }
+        if sub.is_empty() {
+            return Err(LimboError::InternalError(
+                "Principal::new requires non-empty sub".into(),
+            ));
+        }
+        Ok(Self {
+            iss,
+            sub,
+            roles,
+            claims,
+            exp_unix,
+        })
+    }
+}
+
+/// Authorization mode a `Connection` rests in.
+///
+/// * `Trusted` — bypasses the authorizer entirely. Default at `Connection::open`
+///   so existing in-process callers (CLI REPL, tests, simulator, CDC apply via
+///   `connect_untracked`) are unaffected. A sync server downgrades its shared
+///   request connection to `Anonymous` immediately after construction so the
+///   bypass never serves a network request.
+/// * `Authenticated(p)` — set transiently by `with_principal` for the duration
+///   of a single request. The translate-layer authorizer hooks consult the
+///   contained `Principal` for grant lookup and predicate substitution.
+/// * `Anonymous` — resting state for connections that may serve unauthenticated
+///   traffic. Hooks default-deny in this mode.
+#[derive(Clone)]
+pub enum AuthMode {
+    Trusted,
+    Authenticated(Arc<Principal>),
+    Anonymous,
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::Trusted => write!(f, "AuthMode::Trusted"),
+            AuthMode::Anonymous => write!(f, "AuthMode::Anonymous"),
+            AuthMode::Authenticated(p) => write!(
+                f,
+                "AuthMode::Authenticated(iss={:?}, sub={:?})",
+                p.iss, p.sub
+            ),
+        }
+    }
+}
+
+/// Authorizer hook installed on a `Connection`. The pointer is set at server
+/// boot via `set_authorizer` and never changes afterwards. We avoid a fixed
+/// concrete type so tests and the production sync server can register their
+/// own implementations without core depending on the rbac module's
+/// internals.
+pub trait ConnectionAuthorizer: Send + Sync + 'static {
+    /// Called by translate-layer hooks for INSERT/UPDATE/DELETE/DDL/PRAGMA/
+    /// ATTACH/DETACH operations. The trait stays type-erased here; the rbac
+    /// module defines the rich `Authorizer` trait that production code uses.
+    /// This shim exists so `core::rbac::Authorizer` can be installed via
+    /// `Arc<dyn ConnectionAuthorizer>` without circular type definitions
+    /// between `connection.rs` and `rbac::authorizer`.
+    fn authorize_dyn(
+        &self,
+        request: &crate::rbac::authorizer::AuthRequest<'_>,
+    ) -> crate::rbac::authorizer::AuthDecision;
+}
+
+/// Per-connection auth state. Both fields are `pub(crate)` so the translate
+/// hooks can read `mode` and `authorizer` directly without going through
+/// inline accessor methods that the compiler couldn't inline through the
+/// `RwLock`.
+pub(crate) struct AuthContext {
+    pub mode: AuthMode,
+    pub authorizer: Option<Arc<dyn ConnectionAuthorizer>>,
+}
+
+impl AuthContext {
+    pub(crate) fn new_trusted() -> Self {
+        Self {
+            mode: AuthMode::Trusted,
+            authorizer: None,
+        }
+    }
+}
+
+/// RAII guard that restores a connection's pre-request state on Drop.
+///
+/// Captures `auto_commit`, the foreign-keys pragma, and cache_size at
+/// construction so a request handler can flip them transiently (e.g. wrapping
+/// the batch in `BEGIN IMMEDIATE`) without leaking those changes across
+/// principals on the same shared connection. On Drop:
+///
+/// 1. If a transaction is open (`!auto_commit`), issues `ROLLBACK` so a panic
+///    mid-statement can't leave the next request executing inside the prior
+///    principal's transaction.
+/// 2. Restores the captured `auto_commit`/foreign_keys/cache_size values.
+/// 3. Flips `AuthMode` back to `Anonymous`.
+///
+/// The guard is `#[must_use]` so accidental drop-on-statement (`let _ = …`)
+/// turns into a clippy warning rather than a silent guard-immediately-released
+/// bug. By owning captured state inline (no `Box`/heap), drop semantics
+/// guarantee restoration even on panic unwind.
+#[must_use = "PrincipalGuard restores connection state on Drop; binding it to `_` releases it immediately"]
+pub struct PrincipalGuard<'a> {
+    conn: &'a Connection,
+    saved_auto_commit: bool,
+    saved_fk: bool,
+    saved_cache_size: i32,
+    /// Set to `true` after Drop's body has run so a panicking restore step
+    /// doesn't double-fire on re-entry. Always `false` during normal use.
+    finalized: bool,
+}
+
+impl<'a> Drop for PrincipalGuard<'a> {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+
+        // 1. ROLLBACK any transaction the request opened. We tolerate errors
+        //    here because the connection state is about to be reset anyway,
+        //    and propagating a panic out of Drop would abort the process —
+        //    far worse than a possibly-leaked transaction state that the next
+        //    request will overwrite.
+        if !self.conn.auto_commit.load(Ordering::SeqCst) {
+            // Best-effort rollback; ignore errors. The pager-level locks are
+            // unwound by `Connection::Drop` if rollback fails catastrophically.
+            let _ = self.conn.execute_internal_rollback();
+        }
+
+        // 2. Restore captured connection-scope state.
+        self.conn
+            .auto_commit
+            .store(self.saved_auto_commit, Ordering::SeqCst);
+        self.conn.fk_pragma.store(self.saved_fk, Ordering::SeqCst);
+        self.conn
+            .cache_size
+            .store(self.saved_cache_size, Ordering::SeqCst);
+
+        // 3. Reset to Anonymous and bump the prepare-context generation so any
+        //    statement prepared under the prior principal is recompiled before
+        //    the next request reuses cached bytecode.
+        {
+            let mut auth = self.conn.auth.write();
+            auth.mode = AuthMode::Anonymous;
+        }
+        self.conn.bump_prepare_context_generation();
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -280,6 +504,13 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// Authorization state. The `mode` is the active principal context (Trusted by
+    /// default at `open`, Anonymous on connections that serve sync requests after
+    /// `downgrade_to_anonymous`, transient Authenticated during a `with_principal`
+    /// scope). The optional `authorizer` is the policy decision hook installed
+    /// once at server boot via `set_authorizer`. RwLock so the translate hooks can
+    /// take cheap read borrows; writes only happen at request boundaries.
+    pub(crate) auth: RwLock<AuthContext>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -573,6 +804,15 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Access the underlying `Database` so callers (notably the sync server)
+    /// can open sibling connections without going back to the original
+    /// builder. Used by the RBAC bootstrap to keep a permanently-`Trusted`
+    /// connection for TOFU admin-promotion while the request-serving
+    /// connection is downgraded to `Anonymous`.
+    pub fn database(&self) -> &Arc<Database> {
+        &self.db
+    }
+
     /// Bump the prepare context generation counter. Must be called whenever any
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.
@@ -580,6 +820,125 @@ impl Connection {
     pub(crate) fn bump_prepare_context_generation(&self) {
         self.prepare_context_generation
             .fetch_add(1, Ordering::Release);
+    }
+
+    /// Install the policy decision hook on this connection. One-shot: only callable
+    /// while the connection rests in `AuthMode::Trusted` and only when no
+    /// authorizer has been registered yet. The sync server calls this exactly once
+    /// at boot, immediately before `downgrade_to_anonymous`.
+    ///
+    /// Panics on misuse rather than returning an error because:
+    /// (a) the only legitimate caller is server bootstrap, so a misuse here means
+    ///     the security invariant ("default-deny everywhere except Trusted") has
+    ///     been violated and continuing risks data exposure;
+    /// (b) there is no recovery path — the authorizer pointer is shared across
+    ///     all subsequent requests on this connection.
+    pub fn set_authorizer(&self, a: Arc<dyn ConnectionAuthorizer>) {
+        let mut auth = self.auth.write();
+        assert!(
+            matches!(auth.mode, AuthMode::Trusted),
+            "set_authorizer requires Trusted mode at call time; got {:?}",
+            auth.mode
+        );
+        assert!(
+            auth.authorizer.is_none(),
+            "set_authorizer is one-shot; refusing to overwrite existing authorizer"
+        );
+        auth.authorizer = Some(a);
+    }
+
+    /// Irreversibly downgrade this connection from `Trusted` to `Anonymous`.
+    /// Called by the sync server on the shared request connection immediately
+    /// after construction so the connection cannot serve a network request while
+    /// still in bypass mode. Bootstrap work that needs Trusted access must use a
+    /// separate `connect_untracked` connection.
+    ///
+    /// No upgrade path exists. To do further Trusted work, open a new connection.
+    pub fn downgrade_to_anonymous(&self) {
+        let mut auth = self.auth.write();
+        assert!(
+            matches!(auth.mode, AuthMode::Trusted),
+            "downgrade_to_anonymous requires Trusted mode; got {:?}",
+            auth.mode
+        );
+        auth.mode = AuthMode::Anonymous;
+        // Bump generation: any statement prepared while Trusted skipped the
+        // authorizer; after downgrade those cached statements must be reprepared
+        // so authorizer hooks fire.
+        self.bump_prepare_context_generation();
+    }
+
+    /// Returns the current auth mode as a cheap clone. Used by translate hooks
+    /// to fast-path Trusted-mode statements without holding the auth lock across
+    /// the entire compile.
+    #[inline]
+    pub(crate) fn auth_mode_snapshot(&self) -> AuthMode {
+        self.auth.read().mode.clone()
+    }
+
+    /// Returns a clone of the installed authorizer, if any. Translate hooks
+    /// call this once per statement, so the clone (an Arc bump) is cheaper than
+    /// holding the auth read lock across the compile.
+    #[inline]
+    pub(crate) fn authorizer_snapshot(&self) -> Option<Arc<dyn ConnectionAuthorizer>> {
+        self.auth.read().authorizer.clone()
+    }
+
+    /// Install a transient authenticated principal for the duration of the
+    /// returned guard. See `PrincipalGuard` for the restoration contract.
+    ///
+    /// Panics if the connection is not at rest in `AuthMode::Anonymous`. This is
+    /// a `debug_assert!`-shaped invariant — in release builds the guard still
+    /// flips the mode, but reaching this with a non-Anonymous resting state is
+    /// always a bug because the sync server is the only legitimate caller and
+    /// it guarantees Anonymous between requests.
+    pub fn with_principal(self: &Arc<Self>, p: Arc<Principal>) -> PrincipalGuard<'_> {
+        let saved_auto_commit = self.auto_commit.load(Ordering::SeqCst);
+        let saved_fk = self.fk_pragma.load(Ordering::SeqCst);
+        let saved_cache_size = self.cache_size.load(Ordering::SeqCst);
+
+        {
+            let mut auth = self.auth.write();
+            debug_assert!(
+                matches!(auth.mode, AuthMode::Anonymous),
+                "with_principal expects resting Anonymous mode; got {:?}",
+                auth.mode
+            );
+            assert!(
+                auth.authorizer.is_some(),
+                "with_principal requires an authorizer to have been installed via set_authorizer"
+            );
+            auth.mode = AuthMode::Authenticated(p);
+        }
+
+        // Bump the prepare-context generation so prior cached statements
+        // (prepared under the previous principal, or under Anonymous, or
+        // under Trusted) cannot satisfy the current request without
+        // re-running the translate-layer authorizer hooks under the new
+        // principal.
+        self.bump_prepare_context_generation();
+
+        PrincipalGuard {
+            conn: self.as_ref(),
+            saved_auto_commit,
+            saved_fk,
+            saved_cache_size,
+            finalized: false,
+        }
+    }
+
+    /// Best-effort `ROLLBACK` used by `PrincipalGuard::drop` when a request
+    /// returned mid-transaction. Errors are swallowed so a panic on rollback
+    /// doesn't abort the process; the next request will overwrite any
+    /// residual state and the pager-level locks unwind on connection drop.
+    pub(crate) fn execute_internal_rollback(&self) -> Result<()> {
+        // We cannot use `Connection::execute` here because we are inside Drop
+        // and don't have a self: Arc<Self>. Setting auto_commit to true is the
+        // cheapest way to flag the next statement on the conn to treat itself
+        // as outside an explicit txn. Combined with the auth-mode reset, the
+        // next legitimate request will go through `BEGIN IMMEDIATE` again.
+        self.auto_commit.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     #[inline]
@@ -3745,5 +4104,223 @@ mod tests {
 
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.dst"), 1);
         assert_eq!(query_single_i64(&conn, "SELECT SUM(z) FROM main.audit"), 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // RBAC connection-layer tests
+    // -----------------------------------------------------------------------
+
+    use super::{AuthMode, ConnectionAuthorizer, Principal};
+    use crate::rbac::authorizer::{AuthDecision, AuthRequest};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// Always-allow authorizer for tests that only care about mode
+    /// transitions (not policy outcomes).
+    struct AllowAll;
+    impl ConnectionAuthorizer for AllowAll {
+        fn authorize_dyn(&self, _request: &AuthRequest<'_>) -> AuthDecision {
+            AuthDecision::Allow
+        }
+    }
+
+    /// Recording authorizer that captures the last AuthRequest so tests can
+    /// inspect what columns/op got dispatched.
+    #[derive(Default)]
+    struct Recording {
+        last_op: StdMutex<Option<String>>,
+    }
+    impl ConnectionAuthorizer for Recording {
+        fn authorize_dyn(&self, request: &AuthRequest<'_>) -> AuthDecision {
+            let mut slot = self.last_op.lock().unwrap();
+            *slot = Some(format!("{:?}", request.op));
+            AuthDecision::Allow
+        }
+    }
+
+    fn make_principal(sub: &str) -> Arc<Principal> {
+        Arc::new(
+            Principal::new(
+                "https://idp.example.com",
+                sub,
+                vec![],
+                BTreeMap::new(),
+                i64::MAX,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn open_test_conn() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:rbac-test").unwrap();
+        db.connect().unwrap()
+    }
+
+    #[test]
+    fn connection_opens_in_trusted_mode() {
+        let conn = open_test_conn();
+        assert!(matches!(conn.auth_mode_snapshot(), AuthMode::Trusted));
+    }
+
+    #[test]
+    fn downgrade_to_anonymous_is_one_way() {
+        let conn = open_test_conn();
+        conn.set_authorizer(Arc::new(AllowAll));
+        conn.downgrade_to_anonymous();
+        assert!(matches!(conn.auth_mode_snapshot(), AuthMode::Anonymous));
+    }
+
+    #[test]
+    fn with_principal_flips_mode_and_drop_restores() {
+        let conn = open_test_conn();
+        conn.set_authorizer(Arc::new(AllowAll));
+        conn.downgrade_to_anonymous();
+
+        let initial_gen = conn.prepare_context_generation();
+        {
+            let _guard = conn.with_principal(make_principal("alice"));
+            // Inside the guard we are Authenticated under the right principal.
+            match conn.auth_mode_snapshot() {
+                AuthMode::Authenticated(p) => assert_eq!(p.sub, "alice"),
+                other => panic!("expected Authenticated, got {other:?}"),
+            }
+            // Generation must have bumped on entry so cached statements are
+            // re-checked under the new principal.
+            assert!(conn.prepare_context_generation() > initial_gen);
+        }
+        // Guard dropped — back to Anonymous, generation bumped again on exit.
+        assert!(matches!(conn.auth_mode_snapshot(), AuthMode::Anonymous));
+        assert!(conn.prepare_context_generation() > initial_gen + 1);
+    }
+
+    #[test]
+    fn with_principal_drop_restores_auto_commit_and_fk() {
+        let conn = open_test_conn();
+        conn.set_authorizer(Arc::new(AllowAll));
+        conn.downgrade_to_anonymous();
+
+        // Pre-request state.
+        conn.auto_commit.store(true, Ordering::SeqCst);
+        conn.fk_pragma.store(false, Ordering::SeqCst);
+
+        {
+            let _guard = conn.with_principal(make_principal("alice"));
+            // The request flips both. Drop should restore.
+            conn.auto_commit.store(false, Ordering::SeqCst);
+            conn.fk_pragma.store(true, Ordering::SeqCst);
+        }
+        assert!(conn.auto_commit.load(Ordering::SeqCst));
+        assert!(!conn.fk_pragma.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    #[should_panic(expected = "set_authorizer is one-shot")]
+    fn set_authorizer_one_shot_panics() {
+        let conn = open_test_conn();
+        conn.set_authorizer(Arc::new(AllowAll));
+        // Second call must panic; the message contains "one-shot".
+        conn.set_authorizer(Arc::new(AllowAll));
+    }
+
+    #[test]
+    #[should_panic(expected = "set_authorizer requires Trusted")]
+    fn set_authorizer_requires_trusted_panics() {
+        let conn = open_test_conn();
+        // Downgrading without setting an authorizer is allowed only because
+        // we don't actually run with_principal here; for the panic case we
+        // need Anonymous BEFORE set_authorizer.
+        conn.auth.write().mode = AuthMode::Anonymous;
+        // Now set_authorizer must panic because mode != Trusted.
+        conn.set_authorizer(Arc::new(AllowAll));
+    }
+
+    #[test]
+    fn authorizer_snapshot_returns_installed_authorizer() {
+        let conn = open_test_conn();
+        let recording: Arc<dyn ConnectionAuthorizer> = Arc::new(Recording::default());
+        conn.set_authorizer(recording.clone());
+
+        let snap = conn.authorizer_snapshot().expect("authorizer installed");
+        // Two Arc clones must point at the same impl.
+        assert!(Arc::ptr_eq(&snap, &recording));
+    }
+
+    #[test]
+    fn trusted_mode_skips_authorizer_in_rbac_helper() {
+        // The rbac::authorize() helper short-circuits in Trusted mode, so the
+        // recording authorizer's authorize_dyn must NOT fire for a Trusted
+        // connection.
+        let conn = open_test_conn();
+        let recording = Arc::new(Recording::default());
+        conn.set_authorizer(recording.clone());
+        // Connection stays Trusted (default at open).
+
+        let schema = conn.schema.read().clone();
+        let cols: Vec<String> = vec!["x".into()];
+        let decision = crate::rbac::authorize(
+            &conn,
+            &schema,
+            Some("foo"),
+            crate::rbac::AuthOp::Insert,
+            &cols,
+        )
+        .unwrap();
+        assert!(matches!(decision, crate::rbac::HookDecision::Allow));
+        // Recording must NOT have captured anything.
+        assert!(recording.last_op.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn dormant_connection_writes_pass_through_without_authorizer() {
+        // The pre-RBAC behaviour is preserved for any caller that never
+        // installs an authorizer: writes, DDL, PRAGMA, ATTACH must all
+        // succeed exactly as before. This is the in-memory CLI REPL /
+        // embedded-library shape — by far the dominant usage.
+        let conn = open_test_conn();
+        // No set_authorizer, no downgrade. Default-Trusted, authorizer=None.
+        assert!(crate::rbac::is_dormant(&conn));
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("UPDATE t SET b = 'y' WHERE a = 1").unwrap();
+        conn.execute("DELETE FROM t").unwrap();
+        // Still dormant after all that.
+        assert!(crate::rbac::is_dormant(&conn));
+    }
+
+    #[test]
+    fn installing_authorizer_disables_dormant_fast_path() {
+        // Once an authorizer is installed, `is_dormant` returns false even
+        // though the connection is still Trusted. This is the safety
+        // property: a developer-installed authorizer (e.g. for telemetry on
+        // a Trusted REPL) is given the chance to inspect every operation.
+        let conn = open_test_conn();
+        assert!(crate::rbac::is_dormant(&conn));
+        conn.set_authorizer(Arc::new(AllowAll));
+        assert!(
+            !crate::rbac::is_dormant(&conn),
+            "authorizer installed → not dormant even if mode is Trusted"
+        );
+    }
+
+    #[test]
+    fn anonymous_mode_denies_writes_in_rbac_helper() {
+        let conn = open_test_conn();
+        conn.set_authorizer(Arc::new(AllowAll));
+        conn.downgrade_to_anonymous();
+
+        let schema = conn.schema.read().clone();
+        let err = crate::rbac::authorize(
+            &conn,
+            &schema,
+            Some("foo"),
+            crate::rbac::AuthOp::Insert,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LimboError::AuthorizationDenied(_)),
+            "expected AuthorizationDenied, got: {err:?}"
+        );
     }
 }

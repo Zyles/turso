@@ -1094,6 +1094,21 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    // RBAC: gate CREATE TABLE through the DDL authorizer hook. Targeting
+    // `_turso_rbac_*` is hard-denied by the RbacAuthorizer rules even for
+    // admin (Trusted dormant connections bypass entirely via is_dormant).
+    if !crate::rbac::is_dormant(connection) {
+        let _ = crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(tbl_name.name.as_str()),
+            crate::rbac::AuthOp::Ddl {
+                kind: crate::rbac::DdlKind::CreateTable,
+            },
+            &[],
+        )?;
+    }
+
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (body, ctas_info) = match body {
@@ -1784,6 +1799,22 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    // RBAC: gate DROP TABLE through the DDL authorizer. RBAC system tables
+    // are hard-denied here for everyone — losing those tables would either
+    // lock the deployment out (no grants) or fail open depending on the
+    // bootstrap path. Trusted dormant connections skip the check.
+    if !crate::rbac::is_dormant(connection) {
+        let _ = crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(tbl_name.name.as_str()),
+            crate::rbac::AuthOp::Ddl {
+                kind: crate::rbac::DdlKind::DropTable,
+            },
+            &[],
+        )?;
+    }
+
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts::new(4, 40, 4);

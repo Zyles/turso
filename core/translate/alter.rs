@@ -676,6 +676,22 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
+
+    // RBAC: gate ALTER TABLE. RBAC system tables hard-deny here so an admin
+    // can't add a `backdoor TEXT` column to `_turso_rbac_grants` or rename
+    // it out from under the authorizer. Trusted dormant connections skip.
+    if !crate::rbac::is_dormant(connection) {
+        let _ = crate::rbac::authorize(
+            connection,
+            resolver.schema(),
+            Some(qualified_name.name.as_str()),
+            crate::rbac::AuthOp::Ddl {
+                kind: crate::rbac::DdlKind::AlterTable,
+            },
+            &[],
+        )?;
+    }
+
     let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);

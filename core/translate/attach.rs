@@ -24,6 +24,21 @@ pub fn translate_attach(
         ));
     }
 
+    // RBAC: ATTACH is admin-only when active. An attached database has no
+    // grants table so writes against it would be effectively unauthorized —
+    // the simplest fix is to forbid non-admins from mounting external
+    // databases at all (also closes the `:memory:` round-trip abuse). Trusted
+    // dormant connections skip the check so the CLI REPL keeps working.
+    if !crate::rbac::is_dormant(&connection) {
+        let _ = crate::rbac::authorize(
+            &connection,
+            resolver.schema(),
+            None,
+            crate::rbac::AuthOp::Attach,
+            &[],
+        )?;
+    }
+
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
     program.extend(&ProgramBuilderOpts::new(0, 10, 0));
@@ -126,6 +141,19 @@ pub fn translate_detach(
         return Err(crate::LimboError::ParseError(
             "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
         ));
+    }
+
+    // RBAC: DETACH mirrors ATTACH — admin only when active. Trusted dormant
+    // connections skip; otherwise non-admins detaching a database
+    // invalidates whatever grants/predicates referenced that schema.
+    if !crate::rbac::is_dormant(&connection) {
+        let _ = crate::rbac::authorize(
+            &connection,
+            resolver.schema(),
+            None,
+            crate::rbac::AuthOp::Detach,
+            &[],
+        )?;
     }
     // SQLite treats DETACH as a function call to sqlite_detach(dbname)
     program.extend(&ProgramBuilderOpts::new(0, 5, 0));

@@ -101,6 +101,14 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    /// Returned when the active `AuthMode::Authenticated` principal is not permitted
+    /// to perform the requested write/DDL/PRAGMA/ATTACH operation. The message
+    /// embeds the `AuthDecision::Deny` rule label plus table/column context so the
+    /// HTTP edge can surface a useful diagnostic; the rule label itself comes from
+    /// a fixed set of `&'static str` so message text never includes user-controlled
+    /// data that could mislead operators reading logs.
+    #[error("Authorization denied: {0}")]
+    AuthorizationDenied(String),
 }
 
 impl From<crate::alloc::AllocError> for LimboError {
