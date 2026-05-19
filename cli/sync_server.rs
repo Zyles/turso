@@ -433,11 +433,21 @@ impl TursoSyncServer {
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to prepare statement: {}", e);
+                // Distinguish RBAC denials from other prepare failures so
+                // the client sees a stable `AUTHORIZATION_DENIED` code
+                // rather than a generic `PREPARE_ERROR` that mixes
+                // syntax errors and policy denials. Matches the same
+                // detection in execute_batch.
+                let code = if matches!(e, turso_core::LimboError::AuthorizationDenied(_)) {
+                    "AUTHORIZATION_DENIED"
+                } else {
+                    "PREPARE_ERROR"
+                };
+                error!("Failed to prepare statement ({}): {}", code, e);
                 return StreamResult::Error {
                     error: Error {
                         message: e.to_string(),
-                        code: "PREPARE_ERROR".to_string(),
+                        code: code.to_string(),
                     },
                 };
             }
